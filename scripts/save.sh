@@ -121,10 +121,14 @@ number_nonempty_lines_on_screen() {
 }
 
 # tests if there was any command output in the current pane
+# history size and cursor position are passed by the caller when it already
+# has them from the pane list, to avoid two tmux invocations per pane
 pane_has_any_content() {
 	local pane_id="$1"
-	local history_size="$(tmux display -p -t "$pane_id" -F "#{history_size}")"
-	local cursor_y="$(tmux display -p -t "$pane_id" -F "#{cursor_y}")"
+	local history_size="$2"
+	local cursor_y="$3"
+	[ -n "$history_size" ] || history_size="$(tmux display -p -t "$pane_id" -F "#{history_size}")"
+	[ -n "$cursor_y" ] || cursor_y="$(tmux display -p -t "$pane_id" -F "#{cursor_y}")"
 	# doing "cheap" tests first
 	[ "$history_size" -gt 0 ] || # history has any content?
 		[ "$cursor_y" -gt 0 ] || # cursor not in first line?
@@ -135,7 +139,8 @@ capture_pane_contents() {
 	local pane_id="$1"
 	local start_line="-$2"
 	local pane_contents_area="$3"
-	if pane_has_any_content "$pane_id"; then
+	local cursor_y="$4"
+	if pane_has_any_content "$pane_id" "$2" "$cursor_y"; then
 		if [ "$pane_contents_area" = "visible" ]; then
 			start_line="0"
 		fi
@@ -185,8 +190,61 @@ fetch_and_dump_grouped_sessions(){
 	fi
 }
 
+# Same output as the per-pane loop in dump_panes, in a single awk pass: the
+# commands come from the process snapshot instead of one strategy script run
+# per pane. Field handling mirrors `IFS=$d read` (runs of delimiters count as
+# one, backslashes escape the next character) and the directory escaping
+# mirrors `echo $dir | sed 's/ /\\ /'`, so the save file is byte-identical.
+dump_panes_from_ps_snapshot() {
+	dump_panes_raw |
+		LC_ALL=C awk -v d="$d" -v grouped="$GROUPED_SESSIONS" -v snapshot="$RESURRECT_PS_SNAPSHOT" '
+			BEGIN {
+				while ((getline line < snapshot) > 0) {
+					sub(/^ */, "", line)
+					i = index(line, " ")
+					if (i == 0) continue
+					ppid = substr(line, 1, i - 1)
+					cmd = substr(line, i + 1)
+					commands[ppid] = (ppid in commands) ? commands[ppid] "\n" cmd : cmd
+				}
+				close(snapshot)
+			}
+			# splits like `IFS=$d read v1 .. v12` without -r
+			function read_fields(line, f,    n, i, c, cur, max) {
+				max = 12; n = 1; cur = ""
+				sub("^" d "+", "", line)
+				for (i = 1; i <= length(line); i++) {
+					c = substr(line, i, 1)
+					if (c == "\\") {
+						i++
+						cur = cur substr(line, i, 1)
+					} else if (c == d && n < max) {
+						while (substr(line, i + 1, 1) == d) i++
+						f[n++] = cur; cur = ""
+					} else {
+						cur = cur c
+					}
+				}
+				sub(d "+$", "", cur)
+				f[n] = cur
+				for (i = n + 1; i <= max; i++) f[i] = ""
+			}
+			{
+				read_fields($0, f)
+				if (index(grouped, d f[2] d) > 0) next
+				dir = f[8]
+				gsub(/[ \t\n]+/, " ", dir); sub(/^ /, "", dir); sub(/ $/, "", dir)
+				sub(/ /, "\\ ", dir)
+				print f[1] d f[2] d f[3] d f[4] d f[5] d f[6] d f[7] d dir d f[9] d f[10] d ":" commands[f[11]]
+			}'
+}
+
 # translates pane pid to process command running inside a pane
 dump_panes() {
+	if [ -r "$RESURRECT_PS_SNAPSHOT" ]; then
+		dump_panes_from_ps_snapshot
+		return
+	fi
 	local full_command
 	dump_panes_raw |
 		while IFS=$d read line_type session_name window_number window_active window_flags pane_index pane_title dir pane_active pane_command pane_pid history_size; do
@@ -200,18 +258,71 @@ dump_panes() {
 		done
 }
 
-dump_windows() {
-	dump_windows_raw |
-		while IFS=$d read line_type session_name window_index window_name window_active window_flags window_layout; do
-			# not saving windows from grouped sessions
-			if is_session_grouped "$session_name"; then
-				continue
-			fi
-			automatic_rename="$(tmux show-window-options -vt "${session_name}:${window_index}" automatic-rename)"
-			# If the option was unset, use ":" as a placeholder.
-			[ -z "${automatic_rename}" ] && automatic_rename=":"
-			echo "${line_type}${d}${session_name}${d}${window_index}${d}${window_name}${d}${window_active}${d}${window_flags}${d}${window_layout}${d}${automatic_rename}"
+# Prints the window-level automatic-rename value of every window in
+# $windows_raw, one per line and in the same order; an empty line means the
+# option is not set on that window. Windows are queried in batches, one tmux
+# invocation each, instead of one invocation per window. If a batch fails
+# (a window was closed meanwhile) its windows are queried one by one.
+window_automatic_renames() {
+	local windows_raw="$1"
+	local marker="__resurrect_window__"
+	local batch_size=100
+	local -a targets=()
+	local line_type session_name window_index rest
+	while IFS=$d read line_type session_name window_index rest; do
+		[ -n "$line_type" ] || continue
+		targets+=("${session_name}:${window_index}")
+	done <<< "$windows_raw"
+	local total=${#targets[@]}
+	local i=0 j
+	local -a args
+	local output
+	while [ "$i" -lt "$total" ]; do
+		args=()
+		j=$i
+		while [ "$j" -lt "$total" ] && [ $((j - i)) -lt "$batch_size" ]; do
+			[ "$j" -gt "$i" ] && args+=(";")
+			args+=(display-message -p "$marker" ";" show-window-options -v -t "${targets[$j]}" automatic-rename)
+			j=$((j + 1))
 		done
+		if output="$(tmux "${args[@]}" 2>/dev/null)"; then
+			echo "$output" |
+				awk -v marker="$marker" '
+					$0 == marker { if (seen) print value; value = ""; seen = 1; next }
+					{ value = $0 }
+					END { if (seen) print value }'
+		else
+			while [ "$i" -lt "$j" ]; do
+				echo "$(tmux show-window-options -v -t "${targets[$i]}" automatic-rename 2>/dev/null)"
+				i=$((i + 1))
+			done
+		fi
+		i=$j
+	done
+}
+
+dump_windows() {
+	local windows_raw="$(dump_windows_raw)"
+	local -a automatic_renames=()
+	local value
+	while IFS= read -r value; do
+		automatic_renames+=("$value")
+	done < <(window_automatic_renames "$windows_raw")
+	local window_number=0
+	local automatic_rename
+	local line_type session_name window_index window_name window_active window_flags window_layout
+	while IFS=$d read line_type session_name window_index window_name window_active window_flags window_layout; do
+		[ -n "$line_type" ] || continue
+		automatic_rename="${automatic_renames[$window_number]}"
+		window_number=$((window_number + 1))
+		# not saving windows from grouped sessions
+		if is_session_grouped "$session_name"; then
+			continue
+		fi
+		# If the option was unset, use ":" as a placeholder.
+		[ -z "${automatic_rename}" ] && automatic_rename=":"
+		echo "${line_type}${d}${session_name}${d}${window_index}${d}${window_name}${d}${window_active}${d}${window_flags}${d}${window_layout}${d}${automatic_rename}"
+	done <<< "$windows_raw"
 }
 
 dump_state() {
@@ -220,9 +331,9 @@ dump_state() {
 
 dump_pane_contents() {
 	local pane_contents_area="$(get_tmux_option "$pane_contents_area_option" "$default_pane_contents_area")"
-	dump_panes_raw |
-		while IFS=$d read line_type session_name window_number window_active window_flags pane_index pane_title dir pane_active pane_command pane_pid history_size; do
-			capture_pane_contents "${session_name}:${window_number}.${pane_index}" "$history_size" "$pane_contents_area"
+	tmux list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{history_size}${d}#{cursor_y}" |
+		while IFS=$d read session_name window_number pane_index history_size cursor_y; do
+			capture_pane_contents "${session_name}:${window_number}.${pane_index}" "$history_size" "$pane_contents_area" "$cursor_y"
 		done
 }
 

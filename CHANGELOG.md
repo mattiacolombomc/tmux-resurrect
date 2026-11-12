@@ -4,6 +4,10 @@
 - scan the process table once per save instead of once per pane ("ps" save
   command strategy): saves with many panes no longer spend minutes in `ps`
 - "ps" save command strategy: match the pane pid exactly, not by prefix
+- the save no longer starts a process per pane and per window: pane commands
+  are resolved in one pass over the process snapshot, window options are read
+  in batches, and pane history size and cursor position come from the pane
+  list. The save file is byte-identical to the one produced before.
 - only one save can run at a time (lock in the resurrect dir)
 - a save file with no panes, or one that collapsed compared to the previous
   save, is kept as `.broken` and does not replace the `last` link
