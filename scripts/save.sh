@@ -235,14 +235,56 @@ remove_old_backups() {
 		find "${files[@]}" -type f -mtime "+${delete_after}" -exec rm -v "{}" \; > /dev/null
 }
 
+# One process table scan per save, shared with the "ps" save command strategy
+# through RESURRECT_PS_SNAPSHOT (see save_command_strategies/ps.sh).
+create_ps_snapshot() {
+	local save_command_strategy="$(get_tmux_option "$save_command_strategy_option" "$default_save_command_strategy")"
+	[ "$save_command_strategy" = "ps" ] || return 0
+	local snapshot="$(resurrect_dir)/.ps_snapshot.$$"
+	if ps -ao "ppid,args" > "$snapshot" 2>/dev/null; then
+		export RESURRECT_PS_SNAPSHOT="$snapshot"
+	else
+		rm -f "$snapshot"
+	fi
+}
+
+remove_ps_snapshot() {
+	[ -n "$RESURRECT_PS_SNAPSHOT" ] && rm -f "$RESURRECT_PS_SNAPSHOT"
+	unset RESURRECT_PS_SNAPSHOT
+}
+
+# A save file is trusted only if it describes at least one pane and has not
+# collapsed compared to the previous one. A tmux server in trouble (for
+# example out of file descriptors) answers with errors, and the result is a
+# nearly empty file: restoring from it would restore nothing.
+save_file_looks_sane() {
+	local new_file="$1"
+	local last_file="$2"
+	grep -q "^pane" "$new_file" 2>/dev/null || return 1
+	[ -f "$last_file" ] || return 0
+	local new_size="$(wc -c < "$new_file" | tr -d ' ')"
+	local last_size="$(wc -c < "$last_file" | tr -d ' ')"
+	if [ "$new_size" -lt 1024 ] && [ "$last_size" -ge 5120 ]; then
+		return 1
+	fi
+	return 0
+}
+
 save_all() {
 	local resurrect_file_path="$(resurrect_file_path)"
 	local last_resurrect_file="$(last_resurrect_file)"
 	mkdir -p "$(resurrect_dir)"
+	create_ps_snapshot
 	fetch_and_dump_grouped_sessions > "$resurrect_file_path"
 	dump_panes   >> "$resurrect_file_path"
 	dump_windows >> "$resurrect_file_path"
 	dump_state   >> "$resurrect_file_path"
+	remove_ps_snapshot
+	if ! save_file_looks_sane "$resurrect_file_path" "$last_resurrect_file"; then
+		# keep the file for inspection, leave "last" on the previous good save
+		mv "$resurrect_file_path" "${resurrect_file_path}.broken"
+		return 1
+	fi
 	execute_hook "post-save-layout" "$resurrect_file_path"
 	if files_differ "$resurrect_file_path" "$last_resurrect_file"; then
 		ln -fs "$(basename "$resurrect_file_path")" "$last_resurrect_file"
@@ -263,16 +305,60 @@ show_output() {
 	[ "$SCRIPT_OUTPUT" != "quiet" ]
 }
 
+# Only one save at a time. With many panes a save can outlast the interval at
+# which it is triggered (tmux-continuum), and overlapping saves both multiply
+# the load and can leave a truncated save file behind. mkdir is atomic; a lock
+# left by a dead process is taken over.
+save_lock_dir() {
+	echo "$(resurrect_dir)/.save.lock.d"
+}
+
+acquire_save_lock() {
+	local lock_dir="$(save_lock_dir)"
+	mkdir -p "$(resurrect_dir)"
+	if mkdir "$lock_dir" 2>/dev/null; then
+		echo $$ > "$lock_dir/pid"
+		return 0
+	fi
+	local holder_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+	if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
+		return 1
+	fi
+	rm -rf "$lock_dir"
+	if mkdir "$lock_dir" 2>/dev/null; then
+		echo $$ > "$lock_dir/pid"
+		return 0
+	fi
+	return 1
+}
+
+release_save_lock() {
+	rm -rf "$(save_lock_dir)"
+}
+
 main() {
 	if supported_tmux_version_ok; then
+		if ! acquire_save_lock; then
+			if show_output; then
+				display_message "Tmux save already in progress"
+			fi
+			exit 0
+		fi
+		trap 'remove_ps_snapshot; release_save_lock' EXIT
 		if show_output; then
 			start_spinner "Saving..." "Tmux environment saved!"
 		fi
-		save_all
+		local save_status=0
+		save_all || save_status=$?
 		if show_output; then
 			stop_spinner
-			display_message "Tmux environment saved!"
+			if [ "$save_status" -eq 0 ]; then
+				display_message "Tmux environment saved!"
+			else
+				display_message "Tmux save failed: previous save kept"
+			fi
 		fi
+		exit "$save_status"
 	fi
 }
 main

@@ -1,6 +1,12 @@
 # Changelog
 
 ### master
+- scan the process table once per save instead of once per pane ("ps" save
+  command strategy): saves with many panes no longer spend minutes in `ps`
+- "ps" save command strategy: match the pane pid exactly, not by prefix
+- only one save can run at a time (lock in the resurrect dir)
+- a save file with no panes, or one that collapsed compared to the previous
+  save, is kept as `.broken` and does not replace the `last` link
 - Remove deprecated "restoring shell history" feature.
 
 ### v4.0.0, 2022-04-10
