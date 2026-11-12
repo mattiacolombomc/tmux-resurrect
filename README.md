@@ -1,5 +1,79 @@
 # Tmux Resurrect
 
+> [!IMPORTANT]
+> **This is a fork of [tmux-plugins/tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect).**
+> It saves the same things, to the same files, with the same options and key
+> bindings, and it restores them with the same code. The difference is in how
+> saving is done: it stays fast with hundreds of panes, and a failed save never
+> replaces a good one.
+
+## What is different from the original
+
+| | original | this fork |
+|---|---|---|
+| Processes started by a save | one `ps` per pane, plus several `tmux` calls per pane and per window | one `ps` per save |
+| Save duration with 213 panes | 653 s | 5.9 s |
+| CPU time of that save | 322 s | 3.5 s |
+| Two saves at the same time | allowed, they pile up | the second one exits |
+| Save file with no panes, or nearly empty | becomes `last` | kept as `.broken`, `last` is not touched |
+| Pane command lookup | by pid prefix | by exact pid |
+| Restore | — | unchanged |
+
+Measured on macOS with tmux 3.8, on a live server with 213 panes, 159 windows
+and 154 sessions, and about 2300 processes on the machine.
+
+> [!NOTE]
+> **Why the original is slow.** Its default save command strategy runs
+> `ps -ao ppid,args` once for every pane. Each run scans the whole process
+> table. On macOS that takes seconds on a busy machine, so the save time grows
+> with the number of panes. With [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum)
+> a save that takes longer than the save interval overlaps with the next one,
+> and the `ps` processes pile up
+> ([upstream issue #544](https://github.com/tmux-plugins/tmux-resurrect/issues/544)).
+
+The changes, all in `scripts/save.sh` and `save_command_strategies/ps.sh`:
+
+- **One process scan per save.** The process table is read once and shared
+  with the `ps` strategy. Pane commands are then resolved in a single pass,
+  with no process started per pane.
+- **Window options read in batches.** The `automatic-rename` option of all
+  windows is read 100 windows per `tmux` call, not one call per window.
+- **One save at a time.** A save takes a lock in the resurrect directory. A
+  save started while another one is running exits without doing anything. A
+  lock left by a dead process is taken over.
+- **A broken save does not replace a good one.** A tmux server in trouble can
+  answer with errors, and the resulting save file is nearly empty. Such a file
+  is renamed to `.broken` and the `last` link stays on the previous save.
+- **Exact pid match.** The original matches the pane pid by prefix, so pane
+  pid 8075 also picks up the children of pid 80750.
+
+> [!TIP]
+> **The save file is the same.** On the same server the fork and the original
+> produce the same save file, apart from the lines where the prefix match of
+> the original is wrong. Existing save files and settings keep working, and
+> you can go back to the original at any time.
+
+> [!WARNING]
+> The other save command strategies (`pgrep`, `gdb`, `linux_procfs`) still run
+> once per pane, as in the original. The single process scan applies to the
+> default `ps` strategy.
+
+To use the fork with [TPM](https://github.com/tmux-plugins/tpm), replace the
+plugin line in `.tmux.conf`:
+
+    set -g @plugin 'mattiacolombomc/tmux-resurrect'
+
+If the original is already installed, TPM keeps the existing
+`tmux-resurrect` directory. Point it at the fork once:
+
+    cd ~/.tmux/plugins/tmux-resurrect
+    git remote set-url origin https://github.com/mattiacolombomc/tmux-resurrect.git
+    git fetch origin && git reset --hard origin/master
+
+The rest of this README is the original one.
+
+---
+
 [![Build Status](https://travis-ci.org/tmux-plugins/tmux-resurrect.svg?branch=master)](https://travis-ci.org/tmux-plugins/tmux-resurrect)
 
 Restore `tmux` environment after system restart.
