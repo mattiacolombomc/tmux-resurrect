@@ -238,8 +238,9 @@ remove_old_backups() {
 # One process table scan per save, shared with the "ps" save command strategy
 # through RESURRECT_PS_SNAPSHOT (see save_command_strategies/ps.sh).
 create_ps_snapshot() {
-	local save_command_strategy="$(get_tmux_option "$save_command_strategy_option" "$default_save_command_strategy")"
-	[ "$save_command_strategy" = "ps" ] || return 0
+	# decided on the strategy file actually used: an unknown strategy name
+	# falls back to the default one
+	[ "$(basename "$(_save_command_strategy_file)")" = "ps.sh" ] || return 0
 	local snapshot="$(resurrect_dir)/.ps_snapshot.$$"
 	if ps -ao "ppid,args" > "$snapshot" 2>/dev/null; then
 		export RESURRECT_PS_SNAPSHOT="$snapshot"
