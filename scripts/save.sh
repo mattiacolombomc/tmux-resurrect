@@ -6,6 +6,14 @@ source "$CURRENT_DIR/variables.sh"
 source "$CURRENT_DIR/helpers.sh"
 source "$CURRENT_DIR/spinner_helpers.sh"
 
+# Without a UTF-8 locale tmux prints every tab as "_", so the save file would
+# have no usable fields. Callers with a bare environment (GUI launchers, cron)
+# hit this; an interactive shell usually does not.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+	*[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+	*) export LC_ALL="en_US.UTF-8" ;;
+esac
+
 # delimiters
 d=$'\t'
 delimiter=$'\t'
